@@ -1,7 +1,12 @@
 """
 Created on 2025/11/13
 @Author: YZ
-Added: auto-open browser + checkpoint/resume when encountering None data
+Modified:
+    1. 加入经纬度提取。
+    2. 加入获取页面范围逻辑不再需要手动设置范围。
+    3. 加入全流程，可以直接设置完所有任务，不需要再更换链接。
+    4. 新增自定义起始爬取开关和剩余任务显示功能。
+    5. 强化断点记录，确保精准续爬。
 """
 import requests
 import time
@@ -17,29 +22,52 @@ import json
 import os
 import sys
 
-client = MongoClient('mongodb://localhost:27017/')
-db = client['Anjuke']
-collection = db['xiaoqu']
-
+# --- 核心配置区 ---
+MONGO_URI = 'mongodb://localhost:27017/'
+DB_NAME = 'Anjuke'
+COLLECTION_NAME = 'xiaoqu'
 CHECKPOINT_FILE = "crawl_checkpoint.json"
+PAGE_SIZE = 25  # 每页小区数量，固定不改
+
+# --- 公共配置 ---
+COMMON_BASE_URL = "https://chengdu.anjuke.com/community"
+COMMON_PRICE_IDS = ['m3094', 'm3095', 'm3096', 'm3097', 'm3098', 'm3099', 'm3100']  # 均价分区
+
+# --- 爬取任务清单 ---
+CRAWL_TASKS = ['yubei', 'nanan', 'wuhou', 'jinniu', 'chenghua']
+
+# --- 自定义起始爬取配置 ---
+# 启用自定义起始点（True/False）
+ENABLE_CUSTOM_START = False
+# 自定义起始区域 (必须是 CRAWL_TASKS 中的一个)
+CUSTOM_START_REGION = 'nanan'
+# 自定义起始价位 (必须是 COMMON_PRICE_IDS 中的一个)
+CUSTOM_START_PRICE = 'm3096'
+# 自定义起始页码
+CUSTOM_START_PAGE = 2
+
+# --- 初始化 ---
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
 
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-    'Referer': 'https://chongqing.anjuke.com/community/nanana/m3094-p2/',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Connection': 'keep-alive',
-    # 你的 cookie（如需）放在这里
+    #'Cookie': '按需，加入cookie防反扒'
 })
 
+# --- 工具函数 ---
 def safe_text(doc, selector):
     elem = doc(selector)
     return elem.text().strip() if elem else None
 
 def get_page(url):
     try:
-        r = session.get(url, timeout=12)
+        r = session.get(url, timeout=15)
         r.raise_for_status()
         return r.text
     except Exception as e:
@@ -50,24 +78,16 @@ def get_houses_url(html):
     if not html:
         return []
     doc = pq(html)
-    target_div = doc('.list-cell')
-    urls = []
-    for a in target_div('a').items():
-        url = a.attr('href')
-        if url and url.startswith('https://') and '/community/view/' in url and not url.endswith('/jiedu/'):
-            urls.append(url)
-    return urls
+    return [a.attr('href') for a in doc('.list-cell a').items()
+            if a.attr('href') and a.attr('href').startswith('https://') and '/community/view/' in a.attr('href') and not a.attr('href').endswith('/jiedu/')]
 
 def get_house_info(html):
-    if not html:
-        return None
-    try:
-        doc = pq(html)
+    if not html: return None
+    try: doc = pq(html)
     except Exception as e:
-        print("[get_house_info] parse error:", e)
+        print(f"[get_house_info] parse error: {e}")
         return None
-
-    info = {
+    return {
         'title': safe_text(doc, '.community-title .title'),
         'type': safe_text(doc, '.info-list .column-2:nth-child(1) .value'),
         'time': safe_text(doc, '.info-list .column-2:nth-child(3) .value'),
@@ -82,68 +102,43 @@ def get_house_info(html):
         'develop': safe_text(doc, '.info-list .column-1:nth-child(19) .value'),
         'scrape_time': datetime.datetime.now().strftime('%Y/%m/%d'),
     }
-    return info
 
 def extract_community_id_from_url(house_url):
-    # 从 URL 中提取id 
     m = re.search(r'/community/view/(\d+)', house_url)
-    if m:
-        return m.group(1)
-    # 备用提取数字
-    m2 = re.search(r'(\d{5,8})', house_url)
-    return m2.group(1) if m2 else None
+    return m.group(1) if m else (re.search(r'(\d{5,8})', house_url).group(1) if re.search(r'(\d{5,8})', house_url) else None)
 
 def get_lat_lng_from_pano(base_url, community_id):
-    """
-    尝试请求 pano 接口并解析 lat/lng。
-    base_url 例如: "https://chongqing.anjuke.com"
-    community_id 字符串，例如 "594711"
-    返回 (lat, lng) 或 (None, None)
-    """
-    if not community_id:
-        return None, None
-
-    # 尝试的 URL 列表
+    if not community_id: return (None, None)
     candidates = [
         f"{base_url}/esf-ajax/community/pc/pano?community_id={community_id}&comm_id={community_id}",
         f"{base_url}/esf-ajax/community/pc/pano?cid=20&community_id={community_id}&comm_id={community_id}",
     ]
-
     for url in candidates:
         try:
             r = session.get(url, timeout=10)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            # data -> { "data": { "lat": "29.xxxx", "lng": "106.xxxx", ... } }
-            d = data.get('data') if isinstance(data, dict) else None
-            if not d:
-                continue
-            lat = d.get('lat') or d.get('latitude') or None
-            lng = d.get('lng') or d.get('longitude') or None
-            # 有时返回字符串，要确保是数字或字符串格式
-            if lat and lng:
-                return lat, lng
-        except ValueError:
-            # r.json() 解析失败
-            continue
-        except Exception as e:
-            # 请求或其它错误，记录并继续尝试下一个 candidate
-            continue
+            if r.status_code == 200:
+                d = r.json().get('data')
+                if d:
+                    lat = d.get('lat') or d.get('latitude')
+                    lng = d.get('lng') or d.get('longitude')
+                    if lat and lng: return (lat, lng)
+        except (ValueError, requests.RequestException): continue
+    return (None, None)
 
-    return None, None
-
-def save_checkpoint(page_idx, item_idx, url, reason=None):
+# --- 断点续爬函数 ---
+def save_checkpoint(region_path, price_id, page_idx, item_idx, next_url, reason=None):
     data = {
-        "page_idx": int(page_idx),       # 1-based
-        "item_idx": int(item_idx),       # 1-based
-        "url": url,
+        "region_path": region_path,
+        "price_id": price_id,
+        "page_idx": int(page_idx),
+        "item_idx": int(item_idx),
+        "next_url": next_url,
         "reason": reason,
-        "time": datetime.datetime.now().isoformat()
+        "timestamp": datetime.datetime.now().isoformat()
     }
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"[checkpoint] 已保存到 {CHECKPOINT_FILE}: page {page_idx}, item {item_idx}, reason={reason}")
+    print(f"\n[checkpoint] 已保存: {region_path} > {price_id} > 第{page_idx}页 > 第{item_idx}个小区 > URL: {next_url}")
 
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
@@ -151,180 +146,223 @@ def load_checkpoint():
             with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print("读取 checkpoint 失败:", e)
+            print(f"读取 checkpoint 失败: {e}")
     return None
 
-def prompt_manual_intervention(house_url, page_idx, item_idx, reason):
-    """
-    打开浏览器并保存 checkpoint，等待用户在命令行输入 y 继续或 q 退出（并保存）
-    """
+def prompt_manual_intervention(house_url, region_path, price_id, page_idx, item_idx, reason):
     print(f"\n[!]== 遇到问题，暂停爬取 ==[!]")
-    print(f"页面: 第 {page_idx} 页, 第 {item_idx} 个小区")
+    print(f"区域: {region_path} > 价位: {price_id} > 页面: 第 {page_idx} 页 > 小区: 第 {item_idx} 个")
     print(f"URL: {house_url}")
     print(f"原因: {reason}")
-    # 保存 checkpoint
-    save_checkpoint(page_idx, item_idx, house_url, reason=reason)
-    # 在浏览器中打开
+    save_checkpoint(region_path, price_id, page_idx, item_idx, house_url, reason)
     try:
         webbrowser.open(house_url)
-        print("浏览器已打开该链接，请在浏览器中检查/处理（例如完成验证码）。")
+        print("浏览器已打开该链接，请处理（如完成验证码）。")
     except Exception as e:
-        print("尝试打开浏览器失败:", e)
-    # 等待用户输入
+        print(f"尝试打开浏览器失败: {e}")
     while True:
-        cmd = input("处理完后请输入 'y' 继续，'q' 退出并保留断点: ").strip().lower()
+        cmd = input("处理完后请输入 'y' 继续，'q' 退出: ").strip().lower()
         if cmd == 'y':
             print("继续爬取...")
             return True
         elif cmd == 'q':
             print("退出并保留断点。")
             sys.exit(0)
-        else:
-            print("无效输入，请输入 y 或 q。")
 
-def main():
-    urls_1 = ['https://chengdu.anjuke.com/community/yubei/m3094-p' + str(i) + '/#filtersort' for i in range(1, 30)]
-    urls = urls_1
-    url_count = 0
+def extract_total_count(html):
+    if not html: return None
+    match = re.search(r'共找到\s*(\d+)\s*个小区', safe_text(pq(html), '.total-info'))
+    return int(match.group(1)) if match else None
 
-    # 检查是否存在断点
-    cp = load_checkpoint()
-    resume = False
-    start_page = 1
-    start_item = 1
-    if cp:
-        print("检测到断点文件:", CHECKPOINT_FILE)
-        print("断点内容：", cp)
-        ans = input("是否从断点继续？(y继续 / n重新开始): ").strip().lower()
-        if ans == 'y':
-            resume = True
-            start_page = int(cp.get("page_idx", 1))
-            start_item = int(cp.get("item_idx", 1))
-            print(f"将从 page {start_page}, item {start_item} 恢复。")
-        else:
-            print("将从头开始爬取（会覆盖旧断点）。")
+# --- 主爬取逻辑 ---
+def crawl_price_segment(region_path, price_id, start_page=1, start_item=1):
+    region_base_url = f"{COMMON_BASE_URL}/{region_path}"
+    current_segment_base_url = f"{region_base_url}/{price_id}"
 
-    for page_idx, url in enumerate(urls, start=1):
-        # 如果 resume 模式并且当前页小于 start_page，就跳过
-        if resume and page_idx < start_page:
+    print(f"\n{'='*60}")
+    print(f"开始爬取: {region_path} - 价位板块: {price_id}")
+    print(f"{'='*60}")
+
+    session.headers.update({'Referer': f'{current_segment_base_url}/p2/'})
+
+    # 获取总页数
+    first_page_url = f"{current_segment_base_url}/p1/#filtersort"
+    first_page_html = get_page(first_page_url)
+    if not first_page_html or ('verifycode' in first_page_html or 'captcha-verify' in first_page_html):
+        prompt_manual_intervention(first_page_url, region_path, price_id, 1, 0, "获取总页数时遇到验证码或页面请求失败")
+        first_page_html = get_page(first_page_url)
+
+    total_count = extract_total_count(first_page_html)
+    if not total_count:
+        print(f"警告: 在 {region_path} - {price_id} 中未找到任何小区，跳过此价位。")
+        return True
+
+    total_pages = (total_count + PAGE_SIZE - 1) // PAGE_SIZE
+    print(f"找到 {total_count} 个小区，共 {total_pages} 页。")
+
+    # 检查自定义起始页是否超出范围
+    if start_page > total_pages:
+        print(f"警告: 自定义起始页码 {start_page} 大于总页数 {total_pages}，将跳过此价位板块。")
+        return True
+
+    # 遍历页面
+    for page_idx in range(start_page, total_pages + 1):
+        # 【新增】显示剩余页数
+        remaining_pages = total_pages - page_idx
+        print(f"\n--- 正在抓取页面: {page_idx}/{total_pages} (剩余 {remaining_pages} 页) ---")
+        page_url = f"{current_segment_base_url}/p{page_idx}/#filtersort"
+
+        page_html = get_page(page_url)
+        if not page_html:
+            prompt_manual_intervention(page_url, region_path, price_id, page_idx, 1, "页面请求失败")
+            page_html = get_page(page_url)
+            if not page_html: return False
+
+        if 'verifycode' in page_html or 'captcha-verify' in page_html:
+            prompt_manual_intervention(page_url, region_path, price_id, page_idx, 1, "列表页遇到验证码")
             continue
 
-        page_processed = False
-        while not page_processed:
-            print('正在抓取：', url, f"(page {page_idx})")
-            html = get_page(url)
-            if html is None:
-                print("页面请求失败，稍后重新尝试...")
-                time.sleep(3)
+        houses_urls = get_houses_url(page_html)
+        if not houses_urls:
+            print(f"警告: 第 {page_idx} 页未找到小区链接，可能已被封禁或页面结构改变。")
+            save_checkpoint(region_path, price_id, page_idx, 1, page_url, "列表页无小区链接")
+            return False
+
+        current_start_item = start_item if page_idx == start_page else 1
+        for item_idx, house_url in enumerate(houses_urls, start=1):
+            if item_idx < current_start_item:
+                print(f"跳过已处理的小区: 第 {item_idx} 个 -> {house_url}")
                 continue
 
-            # 验证码/登录拦截检测
-            if 'https://callback.58.com/antibot/verifycode?' in html or 'https://www.anjuke.com/captcha-verify/' in html:
-                print("遇到登录或验证码验证，暂停操作，问题链接：", url)
-                input("请在浏览器中完成人工操作后，按回车键继续...")
-                continue
+            print(f"--- 正在处理第 {item_idx}/{len(houses_urls)} 个小区: {house_url}")
 
-            houses_urls = get_houses_url(html)
-            invalid_info_count = 0
+            save_checkpoint(region_path, price_id, page_idx, item_idx, house_url, "正常爬取中")
 
-            # 如果是 resume 且是起始页，用 start_item 跳过前面的 items
-            start_from_item = start_item if (resume and page_idx == start_page) else 1
+            house_html = get_page(house_url)
+            if not house_html:
+                prompt_manual_intervention(house_url, region_path, price_id, page_idx, item_idx, "详情页无法请求")
+                return False
 
-            for i, house_url in enumerate(houses_urls, start=1):
-                # 若 resume 且本页要跳过前面 items
-                if i < start_from_item:
-                    print(f"跳过已处理的小区: page {page_idx} item {i}")
+            house_info = get_house_info(house_html)
+            if not house_info:
+                prompt_manual_intervention(house_url, region_path, price_id, page_idx, item_idx, "详情页解析失败")
+                return False
+
+            community_id = extract_community_id_from_url(house_url)
+            parsed_house_url = urlparse(house_url)
+            lat, lng = get_lat_lng_from_pano(f"{parsed_house_url.scheme}://{parsed_house_url.netloc}", community_id)
+            if not (lat and lng):
+                prompt_manual_intervention(house_url, region_path, price_id, page_idx, item_idx, "无法获取经纬度")
+                return False
+
+            house_info.update({
+                'url': house_url, 'community_id': community_id, 'lat': lat, 'lng': lng,
+                'region_path': region_path, 'price_segment': price_id
+            })
+            try:
+                collection.update_one({'url': house_url}, {'$set': house_info}, upsert=True)
+                print(f"成功保存: {house_info.get('title')}")
+            except Exception as e:
+                print(f"保存到 MongoDB 失败: {e}")
+
+            time.sleep(random.uniform(0.5, 1.2))
+
+        start_item = 1
+
+    print(f"\n{region_path} - {price_id} 爬取完成！")
+    return True
+
+def main():
+    # 断点续爬优先级高于自定义起始
+    cp = load_checkpoint()
+    resume_from_checkpoint = False
+    if cp and input("检测到断点文件，是否从断点继续？(y/n): ").strip().lower() == 'y':
+        resume_from_checkpoint = True
+        print(f"将从断点 {cp['region_path']} > {cp['price_id']} > 第{cp['page_idx']}页 继续爬取。")
+    else:
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+
+    # 处理自定义起始逻辑
+    start_crawling = False
+    # 如果不是从断点续爬，再检查是否启用了自定义起始
+    if not resume_from_checkpoint and ENABLE_CUSTOM_START:
+        if CUSTOM_START_REGION in CRAWL_TASKS and CUSTOM_START_PRICE in COMMON_PRICE_IDS and CUSTOM_START_PAGE > 0:
+            start_crawling = True
+            print(f"\n已启用自定义起始爬取:")
+            print(f"  起始区域: {CUSTOM_START_REGION}")
+            print(f"  起始价位: {CUSTOM_START_PRICE}")
+            print(f"  起始页码: {CUSTOM_START_PAGE}")
+        else:
+            print("\n警告：自定义起始配置无效，请检查 CUSTOM_START_* 变量是否正确设置。程序将从头开始爬取。")
+            ENABLE_CUSTOM_START = False # 禁用无效的自定义起始
+
+    # 外层循环：遍历所有区域路径
+    total_regions = len(CRAWL_TASKS)
+    for i, region_path in enumerate(CRAWL_TASKS):
+        # 【新增】显示剩余区域
+        remaining_regions = total_regions - i - 1
+
+        # 逻辑判断：是否开始爬取当前区域
+        if not start_crawling:
+            if resume_from_checkpoint:
+                if region_path == cp['region_path']:
+                    start_crawling = True # 找到了断点所在的区域，开始爬取
+                else:
+                    print(f"\n跳过已完成的区域: {region_path}")
+            elif ENABLE_CUSTOM_START:
+                if region_path == CUSTOM_START_REGION:
+                    start_crawling = True # 找到了自定义起始区域，开始爬取
+                else:
+                    print(f"\n跳过自定义起始点之前的区域: {region_path}")
+            else: # 既不是断点续爬也不是自定义起始，直接开始
+                start_crawling = True
+
+        if not start_crawling:
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"进入区域: {region_path} (剩余 {remaining_regions} 个区域)")
+        print(f"{'='*60}")
+
+        # 中层循环：遍历当前区域的所有价位
+        total_prices = len(COMMON_PRICE_IDS)
+        for j, price_id in enumerate(COMMON_PRICE_IDS):
+            # 显示当前区域剩余价位
+            remaining_prices_in_region = total_prices - j - 1
+
+            # 逻辑判断：是否开始爬取当前价位
+            if resume_from_checkpoint and region_path == cp['region_path']:
+                if price_id == cp['price_id']:
+                    # 在断点所在的区域，找到了断点所在的价位
+                    success = crawl_price_segment(region_path, price_id, start_page=cp['page_idx'], start_item=cp['item_idx'])
+                    resume_from_checkpoint = False # 爬取完这个价位后，后续不再是断点续爬状态
+                else:
+                    print(f"\n跳过已完成的价位板块: {price_id}")
                     continue
+            elif ENABLE_CUSTOM_START and region_path == CUSTOM_START_REGION:
+                if price_id == CUSTOM_START_PRICE:
+                    # 在自定义起始区域，找到了自定义起始价位
+                    success = crawl_price_segment(region_path, price_id, start_page=CUSTOM_START_PAGE)
+                    ENABLE_CUSTOM_START = False # 爬取完这个价位后，后续不再是自定义起始状态
+                else:
+                    print(f"\n跳过自定义起始点之前的价位板块: {price_id}")
+                    continue
+            else:
+                # 正常爬取当前价位
+                print(f"\n当前区域剩余价位: {remaining_prices_in_region} 个")
+                success = crawl_price_segment(region_path, price_id)
 
-                # 详情页短重试（网络不稳时避免立刻进入人工模式）
-                house_html = None
-                for attempt in range(3):
-                    house_html = get_page(house_url)
-                    if house_html:
-                        break
-                    time.sleep(1 + attempt)  # 逐步加短等待
+            if not success:
+                print(f"\n爬取在区域 {region_path} > 价位 {price_id} 处中断。")
+                return
 
-                if not house_html:
-                    # 记录并打开浏览器，等待人工干预
-                    prompt_manual_intervention(house_url, page_idx, i, reason="详情页无法请求（重试后失败）")
-                    # 用户确认后尝试重新获取一次
-                    house_html = get_page(house_url)
-                    if not house_html:
-                        # 如果仍失败，保存断点并退出
-                        save_checkpoint(page_idx, i, house_url, reason="详情页人工处理后仍无法请求")
-                        print("详情页仍无法获取，已保存断点并退出。")
-                        sys.exit(1)
-
-                house_info = get_house_info(house_html)
-
-                # 如果解析失败（None），直接进入人工处理流程
-                if not house_info:
-                    prompt_manual_intervention(house_url, page_idx, i, reason="详情页解析返回 None")
-                    # 用户处理后再次尝试解析
-                    house_html = get_page(house_url)
-                    house_info = get_house_info(house_html)
-                    if not house_info:
-                        save_checkpoint(page_idx, i, house_url, reason="解析后仍然为 None")
-                        print("解析仍失败，已保存断点并退出。")
-                        sys.exit(1)
-
-                # 提取 community id（通常在 URL 里）
-                community_id = extract_community_id_from_url(house_url)
-                parsed = urlparse(house_url)
-                base_url = f"{parsed.scheme}://{parsed.netloc}"
-
-                # pano 短重试
-                lat, lng = None, None
-                for attempt in range(2):
-                    lat, lng = get_lat_lng_from_pano(base_url, community_id)
-                    if lat and lng:
-                        break
-                    time.sleep(0.5 + attempt)
-
-                if not (lat and lng):
-                    # pano 无经纬度 -> 人工干预
-                    prompt_manual_intervention(house_url, page_idx, i, reason="pano 返回无经纬度（lat/lng）")
-                    # 用户处理后再次请求 pano
-                    lat, lng = get_lat_lng_from_pano(base_url, community_id)
-                    if not (lat and lng):
-                        save_checkpoint(page_idx, i, house_url, reason="pano 人工处理后仍无经纬度")
-                        print("pano 仍无法获取经纬度，已保存断点并退出。")
-                        sys.exit(1)
-
-                # 一切正常则写入 DB
-                house_info['url'] = house_url
-                house_info['community_id'] = community_id
-                house_info['lat'] = lat
-                house_info['lng'] = lng
-
-                key = {'url': house_url} if house_url else {'community_id': community_id}
-                try:
-                    collection.update_one(key, {'$set': house_info}, upsert=True)
-                    print(f"保存: {house_info.get('title')}  lat={lat} lng={lng}")
-                except Exception as e:
-                    print("保存到 MongoDB 失败:", e)
-
-                url_count += 1
-                time.sleep(random.uniform(0.7, 1.4))
-
-                if 1 <= url_count <= 2:
-                    for _ in tqdm(range(10), desc="短暂停"):
-                        time.sleep(3 / 10)
-                elif 4 <= url_count <= 5:
-                    for _ in tqdm(range(10), desc="中暂停"):
-                        time.sleep(8 / 10)
-                elif 10 <= url_count <= 18:
-                    for _ in tqdm(range(10), desc="长暂停"):
-                        time.sleep(20 / 10)
-
-                if url_count > 0 and url_count % 10 == 0:
-                    for _ in tqdm(range(10), desc="长暂停"):
-                        time.sleep(2)
-
-            # 本页处理完成后，将 resume 标记重置（只对起始页有效）
-            resume = False
-            start_item = 1
-            page_processed = True
+    # 所有任务完成
+    print("\n" + "="*60)
+    print("所有区域和价位的爬取任务全部完成！")
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        print("已删除断点文件。")
 
 if __name__ == '__main__':
     main()
