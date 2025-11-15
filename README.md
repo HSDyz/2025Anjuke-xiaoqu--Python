@@ -10,6 +10,8 @@
 #  总而言之，现在只需要设置你要爬取城市的链接、数据库名和集合名，后续不需要再进行设置了。
 # 可能存在一些小问题还未解决
 ----------------------------------------------------------------------------------------
+<img width="1415" height="267" alt="image" src="https://github.com/user-attachments/assets/792def92-348b-4d12-93cb-31134f629aa2" /> <br>
+
 
 <img width="1420" height="549" alt="image" src="https://github.com/user-attachments/assets/32927e2e-0c9e-44af-950b-361564437ec7" />
 
