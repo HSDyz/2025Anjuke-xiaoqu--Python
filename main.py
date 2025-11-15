@@ -50,11 +50,11 @@ DEBUG_HTML_DIR = "debug_html"  # 用于保存调试HTML的目录
 # 城市页面
 COMMON_BASE_URL = "https://chongqing.anjuke.com/community"   # 爬取城市主链接，需要改
 
-# --- 自定义起始爬取配置 (使用动态获取的名称和ID) ---
-ENABLE_CUSTOM_START = True
-CUSTOM_START_REGION_NAME = '潼南'  # 对应实际区域名称
-CUSTOM_START_PRICE_ID = 'm3095'    # 对应价格分段ID
-CUSTOM_START_PAGE = 1    # 页面（无需担心第几个自动覆盖）
+# --- 自定义起始爬取配置，开启后不从头开始爬取 (使用动态获取的名称和ID) ---
+ENABLE_CUSTOM_START = True  #  自定义开始位置开关，False 关闭
+CUSTOM_START_REGION_NAME = '云阳'  # 对应实际区域名称
+CUSTOM_START_PRICE_ID = 'm3094'    # 对应价格分段ID
+CUSTOM_START_PAGE = 3    # 页面（无需担心第几个自动覆盖）
 
 # --- 代理配置 ---
 USE_PROXY = False
@@ -81,7 +81,7 @@ session.headers.update({
     'Referer': COMMON_BASE_URL,
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Connection': 'keep-alive',
-    #'Cookie': '(按需填写加强反爬)',
+    #'Cookie': '(按需填写加强反爬,可以不填)',
 })
 
 batch_cache = []
@@ -408,6 +408,7 @@ def prompt_manual_intervention(house_url, region_name, price_id, page_idx, item_
             logging.info("跳过当前链接，继续爬取...")
             return False
 
+
 def extract_total_count(html, base_url) -> Optional[int]:
     """从基础链接HTML中提取小区总数"""
     if not html:
@@ -416,32 +417,46 @@ def extract_total_count(html, base_url) -> Optional[int]:
 
     try:
         doc = pq(html)
-        total_text = safe_text(doc, '#__layout > div > section > section.list-main > section > div.sort-row > span.total-info')
+        total_text = safe_text(doc,
+                               '#__layout > div > section > section.list-main > section > div.sort-row > span.total-info')
 
         if not total_text:
             logging.warning(f"未找到 .total-info 元素或元素文本为空 (基础链接: {base_url})。尝试备用选择器...")
-            total_text = safe_text(doc, '.sort-row .total-info') or safe_text(doc, '.result-count') or safe_text(doc, '.count')
+            total_text = safe_text(doc, '.sort-row .total-info') or safe_text(doc, '.result-count') or safe_text(doc,
+                                                                                                                 '.count')
 
         if not total_text:
-            # --- 当.total-info确实找不到时，触发安全验证检查 ---
+            # --- 检查是否存在“暂未找到相关小区”的提示 ---
+            empty_text_selector = '#__layout > div > section > section.list-main > section > section > span.empty-text'
+            empty_text = safe_text(doc, empty_text_selector)
+
+            if empty_text and "暂未找到相关小区" in empty_text:
+                logging.info(f"页面明确提示'暂未找到相关小区'，确认该价位板块无数据。 (链接: {base_url})")
+                return 0  # 返回0，表示没有小区
+
+            # --- 原有逻辑：触发安全验证检查 ---
             match = re.search(r'community/([^/]+)/([^/]+)', base_url)
             region_path, price_id = match.groups() if match else ("unknown_region", "unknown_price")
 
-            # 调用新的辅助函数处理
+            # 调用辅助函数处理
             html = check_for_security_verification_and_retry(html, base_url, region_path, price_id)
 
             # 如果辅助函数返回了新的HTML（用户验证成功），则重新解析
             if html:
                 doc = pq(html)
-                total_text = safe_text(doc, '#__layout > div > section > section.list-main > section > div.sort-row > span.total-info')
+                total_text = safe_text(doc,
+                                       '#__layout > div > section > section.list-main > section > div.sort-row > span.total-info')
                 if not total_text:
-                    total_text = safe_text(doc, '.sort-row .total-info') or safe_text(doc, '.result-count') or safe_text(doc, '.count')
+                    total_text = safe_text(doc, '.sort-row .total-info') or safe_text(doc,
+                                                                                      '.result-count') or safe_text(doc,
+                                                                                                                    '.count')
 
         if not total_text:
             sort_row_elem = doc('.sort-row')
             if sort_row_elem:
                 sort_row_html = sort_row_elem.html()
-                logging.debug(f"调试信息: .sort-row 元素存在，HTML内容: {sort_row_html[:200] if sort_row_html else 'None'} (基础链接: {base_url})")
+                logging.debug(
+                    f"调试信息: .sort-row 元素存在，HTML内容: {sort_row_html[:200] if sort_row_html else 'None'} (基础链接: {base_url})")
             else:
                 logging.debug(f"调试信息: 未找到 .sort-row 元素 (基础链接: {base_url})")
             return None
@@ -454,7 +469,7 @@ def extract_total_count(html, base_url) -> Optional[int]:
 
         return int(match.group(1)) if match else None
     except Exception as e:
-        logging.error(f"extract_total_count 解析错误): {e}", exc_info=True)
+        logging.error(f"extract_total_count 解析错误 (基础链接: {base_url}): {e}", exc_info=True)
         return None
 
 def check_for_security_verification_and_retry(html, url, region_path, price_id) -> Optional[str]:
