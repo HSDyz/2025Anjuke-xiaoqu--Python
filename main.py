@@ -23,6 +23,7 @@ import json
 import os
 import sys
 from typing import List, Dict, Tuple, Optional
+from bs4 import BeautifulSoup
 
 # --- 日志配置 ---
 LOG_FILE = "anjuke_crawler.log"
@@ -52,9 +53,9 @@ COMMON_BASE_URL = "https://chongqing.anjuke.com/community"   # 爬取城市主�
 
 # --- 自定义起始爬取配置，开启后不从头开始爬取 (使用动态获取的名称和ID) ---
 ENABLE_CUSTOM_START = True  #  自定义开始位置开关，False 关闭
-CUSTOM_START_REGION_NAME = '云阳'  # 对应实际区域名称
+CUSTOM_START_REGION_NAME = '秀山'  # 对应实际区域名称
 CUSTOM_START_PRICE_ID = 'm3094'    # 对应价格分段ID
-CUSTOM_START_PAGE = 3    # 第几个页面（无需担心第几个小区，自动覆盖）
+CUSTOM_START_PAGE = 1    # 页面（无需担心第几个自动覆盖）
 
 # --- 代理配置 ---
 USE_PROXY = False
@@ -96,6 +97,7 @@ def safe_text(doc, selector):
     elem = doc(selector)
     return elem.text().strip() if elem else None
 
+
 def get_page(url, timeout=15) -> Optional[str]:
     proxies = {'http': get_proxy(), 'https': get_proxy()} if get_proxy() else None
     for attempt in range(RETRY_TIMES):
@@ -103,12 +105,17 @@ def get_page(url, timeout=15) -> Optional[str]:
             r = session.get(url, timeout=timeout, proxies=proxies)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or 'utf-8'
+            html = r.text
 
-            # 检查是否需要验证码
-            if '请输入验证码' in r.text or 'verifycode' in r.text or 'captcha-verify' in r.text:
+            # 先检测是否为登录页面
+            if is_login_page(html):
+                logging.warning(f"访问 {url} 触发登录验证")
+                return None
+            # 再检测原有验证码
+            if '请输入验证码' in html or 'verifycode' in html or 'captcha-verify' in html:
                 logging.warning(f"访问 {url} 触发验证码验证")
                 return None
-            return r.text
+            return html
         except requests.exceptions.RequestException as e:
             logging.error(f"[get_page] 请求失败 (尝试 {attempt + 1}/{RETRY_TIMES}): {url} -> {e}")
             if attempt < RETRY_TIMES - 1:
@@ -472,37 +479,64 @@ def extract_total_count(html, base_url) -> Optional[int]:
         logging.error(f"extract_total_count 解析错误 (基础链接: {base_url}): {e}", exc_info=True)
         return None
 
+
 def check_for_security_verification_and_retry(html, url, region_path, price_id) -> Optional[str]:
-    """
-    检查HTML中是否存在“安全验证”
-    """
-    # 确保调试目录存在
     os.makedirs(DEBUG_HTML_DIR, exist_ok=True)
 
-    # 1. 保存HTML文件
+    # 保存HTML用于调试
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{DEBUG_HTML_DIR}/debug_{region_path}_{price_id}_{timestamp}.html"
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(html)
     logging.info(f"已将出错页面的HTML保存至: {filename}")
 
-    # 2. 检查是否包含“安全验证”
+    # 先检测是否为登录页面
+    if is_login_page(html):
+        logging.warning("检测到页面为登录页面，需手动登录验证。")
+        logging.warning(f"请访问链接完成登录: {url}")
+
+        # 触发手动干预
+        logging.warning(f"\n[!]== 触发登录验证，请手动处理 ==[!]")
+        logging.warning(f"请访问以下链接登录账号: {url}")
+        logging.warning(f"完成登录后，回到此控制台。")
+
+        while True:
+            cmd = input("\n完成登录后，请输入 'y' 重试链接，'s' 跳过此链接，'q' 退出: ").strip().lower()
+            if cmd == 'y':
+                logging.info("用户已完成登录，正在重试链接...")
+                new_html = get_page(url)
+                if new_html:
+                    logging.info("重试成功，获取到新的页面内容。")
+                    return new_html
+                else:
+                    logging.error("重试失败，链接仍然无法访问。")
+                    return None
+            elif cmd == 's':
+                logging.info("用户选择跳过此链接。")
+                return None
+            elif cmd == 'q':
+                logging.info("用户选择退出。")
+                if batch_cache:
+                    try:
+                        collection.insert_many(batch_cache, ordered=False)
+                        logging.info(f"退出时保存了 {len(batch_cache)} 条缓存数据")
+                    except Exception as e:
+                        logging.error(f"退出时保存缓存数据失败: {e}")
+                sys.exit(0)
+
+    # 原有安全验证检测逻辑
     if '安全验证' in html:
         logging.warning("检测到页面包含 '安全验证' 字样。")
-
-        # 3. 提取第二个https链接
+        # 后续逻辑不变...
         https_links = re.findall(r'https://[^\s"\']+', html)
-        verification_url = None
-        if len(https_links) >= 2:
-            verification_url = https_links[1]
+        verification_url = https_links[1] if len(https_links) >= 2 else None
+        if verification_url:
             logging.info(f"提取到HTTPS链接 (用于验证): {verification_url}")
         else:
             logging.error("未在页面中找到HTTPS链接，无法自动提取验证链接。")
-            # 提示用户查看保存的HTML文件
             print(f"\n请手动打开{COMMON_BASE_URL}完成安全验证。")
             print("请点击原始链接完成安全验证:", url)
 
-        # 4. 暂停并提示用户
         logging.warning(f"\n[!]== 触发安全验证，请手动处理 ==[!]")
         logging.warning(f"请点击或访问以下链接进行安全验证: {verification_url if verification_url else '请查看HTML文件'}")
         logging.warning(f"完成验证后，回到此控制台。")
@@ -517,7 +551,6 @@ def check_for_security_verification_and_retry(html, url, region_path, price_id) 
             cmd = input("\n完成验证后，请输入 'y' 重试原始链接，'s' 跳过此链接，'q' 退出: ").strip().lower()
             if cmd == 'y':
                 logging.info("用户已完成验证，正在重试原始链接...")
-                # 5. 重试原始链接
                 new_html = get_page(url)
                 if new_html:
                     logging.info("重试成功，获取到新的页面内容。")
@@ -531,8 +564,11 @@ def check_for_security_verification_and_retry(html, url, region_path, price_id) 
             elif cmd == 'q':
                 logging.info("用户选择退出。")
                 if batch_cache:
-                    try: collection.insert_many(batch_cache, ordered=False); logging.info(f"退出时保存了 {len(batch_cache)} 条缓存数据")
-                    except Exception as e: logging.error(f"退出时保存缓存数据失败: {e}")
+                    try:
+                        collection.insert_many(batch_cache, ordered=False)
+                        logging.info(f"退出时保存了 {len(batch_cache)} 条缓存数据")
+                    except Exception as e:
+                        logging.error(f"退出时保存缓存数据失败: {e}")
                 sys.exit(0)
     else:
         logging.info("页面中未发现 '安全验证' 字样，可能该价位没有小区，可选择打开链接检验。")
@@ -697,6 +733,52 @@ def crawl_price_segment(region_info: Dict, price_id: str, start_page=1, start_it
 
     logging.info(f"\n{region_name} - {price_id} 爬取完成！共爬取 {crawled_count} 个小区。")
     return True
+
+
+def is_login_page(html_content):
+    if not html_content:
+        return False
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    # 特征1：标题为“登录”
+    title_contains_login = False
+    title_tag = soup.title
+    if title_tag and title_tag.text.strip() == '登录':
+        title_contains_login = True
+
+    # 特征2：存在手机号/验证码输入框
+    has_login_inputs = False
+    login_placeholders = {'请输入手机号码', '请输入短信验证码', '请输入图片验证码'}
+    for input_tag in soup.find_all('input'):
+        placeholder = input_tag.get('placeholder', '').strip()
+        if placeholder in login_placeholders:
+            has_login_inputs = True
+            break
+
+    # 特征3：存在“登录”按钮（div或button标签）
+    has_login_button = False
+    # 检查div按钮
+    div_buttons = soup.find_all('div', string=lambda text: text and '登录' in text.strip())
+    if div_buttons:
+        has_login_button = True
+    else:
+        # 检查button标签
+        button_tags = soup.find_all('button', string=lambda text: text and '登录' in text.strip())
+        if button_tags:
+            has_login_button = True
+
+    # 特征4：存在登录模块标题（扫码登录/手机登录/账号密码登录）
+    has_login_modules = False
+    login_module_titles = {'扫码登录', '手机登录', '账号密码登录'}
+    for div in soup.find_all('div'):
+        text = div.text.strip()
+        if text in login_module_titles:
+            has_login_modules = True
+            break
+
+    # 满足核心特征组合则判定为登录页面
+    return (title_contains_login and has_login_inputs) or \
+           (has_login_button and has_login_modules)
 
 def main():
     global CRAWL_TASKS, COMMON_PRICE_IDS, ENABLE_CUSTOM_START
