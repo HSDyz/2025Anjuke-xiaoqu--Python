@@ -53,7 +53,7 @@ COMMON_BASE_URL = "https://chongqing.anjuke.com/community"   # 爬取城市主�
 
 # --- 自定义起始爬取配置，开启后不从头开始爬取 (使用动态获取的名称和ID) ---
 ENABLE_CUSTOM_START = True  #  自定义开始位置开关，False 关闭
-CUSTOM_START_REGION_NAME = '黔江'  # 对应实际区域名称
+CUSTOM_START_REGION_NAME = '巫山'  # 对应实际区域名称
 CUSTOM_START_PRICE_ID = 'm3094'    # 对应价格分段ID
 CUSTOM_START_PAGE = 1    # 页面（无需担心第几个自动覆盖）
 
@@ -82,7 +82,7 @@ session.headers.update({
     'Referer': COMMON_BASE_URL,
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Connection': 'keep-alive',
-    #'Cookie': '(按需填写加强反爬,可以不填)',
+    'Cookie': '填入你的Cookie',
 })
 
 batch_cache = []
@@ -109,7 +109,7 @@ def get_page(url, timeout=15) -> Optional[str]:
 
             # 先检测是否为登录页面
             if is_login_page(html):
-                logging.warning(f"访问 {url} 触发登录验证，打开链接正常建议退出再打开登录")
+                logging.warning(f"访问 {url} 触发登录验证，打开链接")
                 return None
             # 再检测原有验证码
             if '请输入验证码' in html or 'verifycode' in html or 'captcha-verify' in html:
@@ -439,6 +439,7 @@ def extract_total_count(html, base_url) -> Optional[int]:
 
             if empty_text and "暂未找到相关小区" in empty_text:
                 logging.info(f"页面明确提示'暂未找到相关小区'，确认该价位板块无数据。 (链接: {base_url})")
+                time.sleep(2)
                 return 0  # 返回0，表示没有小区
 
             # --- 原有逻辑：触发安全验证检查 ---
