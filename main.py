@@ -1,5 +1,5 @@
 """
-Created on 2025/11/13
+Created on 2025/11/15
 @Author: YZ
 Modified:
     1. 动态获取区域列表和价格分段，不再硬编码。
@@ -38,22 +38,23 @@ logging.basicConfig(
 # --- 核心配置区 ---
 MONGO_URI = 'mongodb://localhost:27017/'
 DB_NAME = 'Anjuke'  # 数据库连接名
-COLLECTION_NAME = 'xiaoqu' # 数据库集合名
+COLLECTION_NAME = 'xiaoqu'  # 数据库集合名
 CHECKPOINT_FILE = "anjuke_check.json"  # 断点保存记录文件
 PAGE_SIZE = 25  # 每页小区数量，固定不改
 BATCH_INSERT_SIZE = 50  # 批量插入大小，不改
 RETRY_TIMES = 3  # 网络请求重试次数
 REGIONS_PRICES_FILE = "regions_prices.json"  # 存储动态获取的区域和价格信息
+DEBUG_HTML_DIR = "debug_html"  # 用于保存调试HTML的目录
 
 # --- 公共配置 ---
-# 城市的根社区页面
-COMMON_BASE_URL = "https://chongqing.anjuke.com/community"   #爬取城市主链接，需要改
+# 城市页面
+COMMON_BASE_URL = "https://chongqing.anjuke.com/community"   # 爬取城市主链接，需要改
 
 # --- 自定义起始爬取配置 (使用动态获取的名称和ID) ---
-ENABLE_CUSTOM_START = False
-CUSTOM_START_REGION_NAME = '两江新区'  # 对应实际区域名称
-CUSTOM_START_PRICE_ID = 'm3094'    # 对应价格分段ID
-CUSTOM_START_PAGE = 1
+ENABLE_CUSTOM_START = True
+CUSTOM_START_REGION_NAME = '潼南'  # 对应实际区域名称
+CUSTOM_START_PRICE_ID = 'm3095'    # 对应价格分段ID
+CUSTOM_START_PAGE = 1    # 页面（无需担心第几个自动覆盖）
 
 # --- 代理配置 ---
 USE_PROXY = False
@@ -247,12 +248,21 @@ def extract_community_id_from_url(house_url) -> Optional[str]:
     m = re.search(r'(\d{5,8})', house_url)
     return m.group(1) if m else None
 
-def get_lat_lng_from_pano(base_url, community_id) -> Tuple[Optional[float], Optional[float]]:
+
+def get_lat_lng_from_pano(base_url, community_id, house_url, region_name, price_id, page_idx, item_idx, progress) -> \
+Tuple[Optional[float], Optional[float]]:
+    """
+    从全景接口获取经纬度，3次失败后触发手动验证
+    """
     if not community_id: return (None, None)
+
     candidates = [
         f"{base_url}/esf-ajax/community/pc/pano?community_id={community_id}&comm_id={community_id}",
         f"{base_url}/esf-ajax/community/pc/pano?cid=20&community_id={community_id}&comm_id={community_id}",
     ]
+
+    failed_api_url = None  # 记录失败的接口链接
+    # 第一次尝试获取经纬度
     for url in candidates:
         for attempt in range(RETRY_TIMES):
             try:
@@ -266,8 +276,40 @@ def get_lat_lng_from_pano(base_url, community_id) -> Tuple[Optional[float], Opti
                         if lat and lng: return (float(lat), float(lng))
             except Exception as e:
                 logging.warning(f"[get_lat_lng] 获取失败 (尝试 {attempt + 1}/{RETRY_TIMES}): {url} -> {e}")
+                failed_api_url = url  # 记录最后一次失败的接口链接
                 time.sleep(random.uniform(0.5, 1.5))
+
+    # 3次尝试失败，触发手动验证（使用失败的接口链接）
+    verify_url = failed_api_url if failed_api_url else house_url  # 优先用接口链接，无则降级用详情页
+    logging.warning(f"[get_lat_lng] 经纬度获取失败，触发手动验证（验证链接：{verify_url}）")
+    user_choice = prompt_manual_intervention(
+        verify_url,  # 传入失败的接口链接
+        region_name, price_id, page_idx, item_idx,
+        f"经纬度接口请求失败，需验证接口链接：{verify_url}"
+    )
+
+    # 根据用户选择处理
+    if user_choice:
+        # 用户选择继续，重新尝试获取经纬度
+        for url in candidates:
+            try:
+                proxies = {'http': get_proxy(), 'https': get_proxy()} if get_proxy() else None
+                r = session.get(url, timeout=10, proxies=proxies)
+                if r.status_code == 200:
+                    d = r.json().get('data')
+                    if d:
+                        lat = d.get('lat') or d.get('latitude')
+                        lng = d.get('lng') or d.get('longitude')
+                        if lat and lng:
+                            logging.info(f"[get_lat_lng] 验证后获取经纬度成功: lat={lat}, lng={lng}")
+                            return (float(lat), float(lng))
+            except Exception as e:
+                logging.warning(f"[get_lat_lng] 验证后重试失败: {url} -> {e}")
+                time.sleep(random.uniform(0.5, 1.5))
+
+    # 用户选择跳过或重试失败，返回None
     return (None, None)
+
 
 def save_to_mongodb(house_info: Dict, batch: bool = True):
     global batch_cache
@@ -275,18 +317,51 @@ def save_to_mongodb(house_info: Dict, batch: bool = True):
         batch_cache.append(house_info)
         if len(batch_cache) >= BATCH_INSERT_SIZE:
             try:
-                collection.insert_many(batch_cache, ordered=False)
-                logging.info(f"批量插入 {len(batch_cache)} 条数据成功")
+                # 提取缓存中所有url，查询已存在的记录
+                cache_urls = [info['url'] for info in batch_cache]
+                existing_urls = set(
+                    doc['url'] for doc in collection.find({'url': {'$in': cache_urls}}, {'url': 1})
+                )
+
+                valid_cache = []
+                for info in batch_cache:
+                    # 跳过已存在的记录
+                    if info['url'] in existing_urls:
+                        logging.debug(f"跳过重复数据: {info['url']}")
+                        continue
+                    info.pop('_id', None)
+                    valid_cache.append(info)
+
+                if not valid_cache:
+                    logging.info("批量缓存中无新数据，跳过插入")
+                    batch_cache.clear()
+                    return
+
+                result = collection.insert_many(valid_cache, ordered=False)
+                logging.info(f"批量插入 {len(result.inserted_ids)} 条新数据（过滤掉 {len(batch_cache) - len(valid_cache)} 条重复数据）")
                 batch_cache.clear()
             except Exception as e:
                 logging.error(f"批量插入失败: {e}")
                 for info in batch_cache:
-                    try: collection.update_one({'url': info['url']}, {'$set': info}, upsert=True)
-                    except Exception as single_e: logging.error(f"单条插入失败: {single_e}")
+                    try:
+                        info.pop('_id', None)
+                        collection.update_one(
+                            {'url': info['url']},
+                            {'$set': info},
+                            upsert=True
+                        )
+                        logging.debug(f"单条插入/更新成功: {info['url']}")
+                    except Exception as single_e:
+                        logging.error(f"单条插入/更新失败 ({info['url']}): {single_e}")
                 batch_cache.clear()
     else:
-        try: collection.update_one({'url': house_info['url']}, {'$set': house_info}, upsert=True)
-        except Exception as e: logging.error(f"保存数据失败: {e}")
+        try:
+            house_info.pop('_id', None)
+            collection.update_one({'url': house_info['url']}, {'$set': house_info}, upsert=True)
+            logging.debug(f"单条插入/更新成功: {house_info['url']}")
+        except Exception as e:
+            logging.error(f"单条插入/更新失败 ({house_info['url']}): {e}")
+
 
 def save_checkpoint(region_name, price_id, page_idx, item_idx, next_url, reason=None, total_progress=None):
     data = {
@@ -346,17 +421,31 @@ def extract_total_count(html, base_url) -> Optional[int]:
             logging.warning(f"未找到 .total-info 元素或元素文本为空 (基础链接: {base_url})。尝试备用选择器...")
             total_text = safe_text(doc, '.sort-row .total-info') or safe_text(doc, '.result-count') or safe_text(doc, '.count')
 
-            if not total_text:
-                sort_row_elem = doc('.sort-row')
-                if sort_row_elem:
-                    sort_row_html = sort_row_elem.html()
-                    logging.debug(f"调试信息: .sort-row 元素存在，HTML内容: {sort_row_html[:200] if sort_row_html else 'None'} (基础链接: {base_url})")
-                else:
-                    logging.debug(f"调试信息: 未找到 .sort-row 元素 (基础链接: {base_url})")
-                return None
+        if not total_text:
+            # --- 当.total-info确实找不到时，触发安全验证检查 ---
+            match = re.search(r'community/([^/]+)/([^/]+)', base_url)
+            region_path, price_id = match.groups() if match else ("unknown_region", "unknown_price")
+
+            # 调用新的辅助函数处理
+            html = check_for_security_verification_and_retry(html, base_url, region_path, price_id)
+
+            # 如果辅助函数返回了新的HTML（用户验证成功），则重新解析
+            if html:
+                doc = pq(html)
+                total_text = safe_text(doc, '#__layout > div > section > section.list-main > section > div.sort-row > span.total-info')
+                if not total_text:
+                    total_text = safe_text(doc, '.sort-row .total-info') or safe_text(doc, '.result-count') or safe_text(doc, '.count')
+
+        if not total_text:
+            sort_row_elem = doc('.sort-row')
+            if sort_row_elem:
+                sort_row_html = sort_row_elem.html()
+                logging.debug(f"调试信息: .sort-row 元素存在，HTML内容: {sort_row_html[:200] if sort_row_html else 'None'} (基础链接: {base_url})")
+            else:
+                logging.debug(f"调试信息: 未找到 .sort-row 元素 (基础链接: {base_url})")
+            return None
 
         logging.info(f"找到总数文本: '{total_text}'")
-        #logging.info(f"找到总数文本: '{total_text}' (基础链接: {base_url})")     测试时使用
 
         match = re.search(r'共找到\s*(\d+)\s*个小区', total_text)
         if not match:
@@ -366,6 +455,73 @@ def extract_total_count(html, base_url) -> Optional[int]:
     except Exception as e:
         logging.error(f"extract_total_count 解析错误): {e}", exc_info=True)
         return None
+
+def check_for_security_verification_and_retry(html, url, region_path, price_id) -> Optional[str]:
+    """
+    检查HTML中是否存在“安全验证”
+    """
+    # 确保调试目录存在
+    os.makedirs(DEBUG_HTML_DIR, exist_ok=True)
+
+    # 1. 保存HTML文件
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{DEBUG_HTML_DIR}/debug_{region_path}_{price_id}_{timestamp}.html"
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(html)
+    logging.info(f"已将出错页面的HTML保存至: {filename}")
+
+    # 2. 检查是否包含“安全验证”
+    if '安全验证' in html:
+        logging.warning("检测到页面包含 '安全验证' 字样。")
+
+        # 3. 提取第二个https链接
+        https_links = re.findall(r'https://[^\s"\']+', html)
+        verification_url = None
+        if len(https_links) >= 2:
+            verification_url = https_links[1]
+            logging.info(f"提取到HTTPS链接 (用于验证): {verification_url}")
+        else:
+            logging.error("未在页面中找到HTTPS链接，无法自动提取验证链接。")
+            # 提示用户查看保存的HTML文件
+            print(f"\n请手动打开{COMMON_BASE_URL}完成安全验证。")
+            print("请点击原始链接完成安全验证:", url)
+
+        # 4. 暂停并提示用户
+        logging.warning(f"\n[!]== 触发安全验证，请手动处理 ==[!]")
+        logging.warning(f"请点击或访问以下链接进行安全验证: {verification_url if verification_url else '请查看HTML文件'}")
+        logging.warning(f"完成验证后，回到此控制台。")
+
+        if verification_url:
+            try:
+                webbrowser.open(verification_url)
+            except Exception as e:
+                logging.error(f"尝试自动打开浏览器失败: {e}")
+
+        while True:
+            cmd = input("\n完成验证后，请输入 'y' 重试原始链接，'s' 跳过此链接，'q' 退出: ").strip().lower()
+            if cmd == 'y':
+                logging.info("用户已完成验证，正在重试原始链接...")
+                # 5. 重试原始链接
+                new_html = get_page(url)
+                if new_html:
+                    logging.info("重试成功，获取到新的页面内容。")
+                    return new_html
+                else:
+                    logging.error("重试失败，链接仍然无法访问。")
+                    return None
+            elif cmd == 's':
+                logging.info("用户选择跳过此链接。")
+                return None
+            elif cmd == 'q':
+                logging.info("用户选择退出。")
+                if batch_cache:
+                    try: collection.insert_many(batch_cache, ordered=False); logging.info(f"退出时保存了 {len(batch_cache)} 条缓存数据")
+                    except Exception as e: logging.error(f"退出时保存缓存数据失败: {e}")
+                sys.exit(0)
+    else:
+        logging.info("页面中未发现 '安全验证' 字样，可能该价位没有小区，可选择打开链接检验。")
+
+    return None
 
 def calculate_progress(region_index: int, price_index: int, page_idx: int, total_pages: int) -> float:
     total_regions = len(CRAWL_TASKS)
@@ -453,6 +609,10 @@ def crawl_price_segment(region_info: Dict, price_id: str, start_page=1, start_it
                 logging.info(f"跳过已处理的小区: 第 {item_idx} 个 -> {house_url}")
                 continue
 
+            if collection.count_documents({'url': house_url}, limit=1) > 0:
+                logging.info(f"小区 {house_url} 已存在于数据库，跳过爬取")
+                continue
+
             logging.info(f"--- 正在处理第 {item_idx}/{len(houses_urls)} 个小区: {house_url}")
             save_checkpoint(region_name, price_id, page_idx, item_idx, house_url, "正常爬取中", progress)
 
@@ -472,7 +632,13 @@ def crawl_price_segment(region_info: Dict, price_id: str, start_page=1, start_it
             community_id = extract_community_id_from_url(house_url)
             parsed_house_url = urlparse(house_url)
             base_domain = f"{parsed_house_url.scheme}://{parsed_house_url.netloc}"
-            lat, lng = get_lat_lng_from_pano(base_domain, community_id)
+
+            # 调用修改后的经纬度获取函数，传入必要参数
+            lat, lng = get_lat_lng_from_pano(
+                base_domain, community_id, house_url,
+                region_name, price_id, page_idx, item_idx, progress
+            )
+
             if not (lat and lng):
                 logging.warning(f"无法获取 {house_url} 的经纬度")
 
@@ -547,7 +713,7 @@ def main():
     first_region = CRAWL_TASKS[0]
     first_price = COMMON_PRICE_IDS[0]
     verify_base_url = f"{COMMON_BASE_URL}/{first_region['path']}/{first_price}"
-    logging.info(f"强制验证链接（基础链接，无分页）: {verify_base_url}")
+    logging.info(f"强制验证链接: {verify_base_url}")
     prompt_manual_intervention(verify_base_url, "启动强制验证", first_price, 1, 0, "程序启动前强制完成验证码验证，避免后续爬取中断")
 
     # 打印配置信息
