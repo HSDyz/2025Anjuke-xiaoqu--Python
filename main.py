@@ -229,6 +229,7 @@ def get_house_info(html) -> Optional[Dict]:
     return {
         'title': safe_text(doc, '.community-title .title'),
         'type': safe_text(doc, '.info-list .column-2:nth-child(1) .value'),
+        'price': safe_text(doc, '.house-price_compare .average'),  # 价格提取
         'time': safe_text(doc, '.info-list .column-2:nth-child(3) .value'),
         'owner': safe_text(doc, '.info-list .column-2:nth-child(4) .value'),
         'number': safe_text(doc, '.info-list .column-2:nth-child(5) .value'),
