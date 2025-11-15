@@ -539,7 +539,7 @@ def check_for_security_verification_and_retry(html, url, region_path, price_id) 
             print("请点击原始链接完成安全验证:", url)
 
         logging.warning(f"\n[!]== 触发安全验证，请手动处理 ==[!]")
-        logging.warning(f"请点击或访问以下链接进行安全验证: {verification_url if verification_url else '请查看HTML文件'}")
+        logging.warning(f"请点击或访问以下链接进行安全验证: {verification_url} if verification_url else '请查看HTML文件'")
         logging.warning(f"完成验证后，回到此控制台。")
 
         if verification_url:
