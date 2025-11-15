@@ -54,7 +54,7 @@ COMMON_BASE_URL = "https://chongqing.anjuke.com/community"   # 爬取城市主�
 ENABLE_CUSTOM_START = True  #  自定义开始位置开关，False 关闭
 CUSTOM_START_REGION_NAME = '云阳'  # 对应实际区域名称
 CUSTOM_START_PRICE_ID = 'm3094'    # 对应价格分段ID
-CUSTOM_START_PAGE = 3    # 页面（无需担心第几个自动覆盖）
+CUSTOM_START_PAGE = 3    # 第几个页面（无需担心第几个小区，自动覆盖）
 
 # --- 代理配置 ---
 USE_PROXY = False
